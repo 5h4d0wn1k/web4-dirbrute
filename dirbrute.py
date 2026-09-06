@@ -4,6 +4,7 @@ WEB4 — Directory Bruteforcer
 HTTP directory brute-force scanner with recursive scanning and thread support.
 """
 
+import json
 import sys
 import time
 import argparse
@@ -13,6 +14,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import List, Optional, Set
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
 DEFAULT_WORDLIST = [
@@ -31,6 +33,7 @@ DEFAULT_WORDLIST = [
     "cgi-bin", "scripts", "bin", "conf", "etc", "var",
     "log", "logs", "error", "errors", "status", "health",
     "version", "info", "about", "contact", "legal", "privacy",
+    "private", "secret", "internal", "hidden", "secure",
 ]
 
 
@@ -67,6 +70,7 @@ class DirBruteforcer:
         timeout: int = 5,
         recursive: bool = False,
         follow_redirects: bool = False,
+        verbose: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         self.wordlist = wordlist or DEFAULT_WORDLIST
@@ -76,6 +80,7 @@ class DirBruteforcer:
         self.timeout = timeout
         self.recursive = recursive
         self.follow_redirects = follow_redirects
+        self.verbose = verbose
         self.results: List[ScanResult] = []
         self.stats = ScanStats()
         self._stop_event = threading.Event()
@@ -207,7 +212,8 @@ class DirBruteforcer:
             for path in batch:
                 urls.extend(self._build_urls(path))
 
-            print(f"  [depth={depth}] Scanning {len(urls)} URLs...")
+            if self.verbose:
+                print(f"  [depth={depth}] Scanning {len(urls)} URLs...")
             found = self._scan_batch(urls)
 
             if self.recursive:
@@ -243,6 +249,17 @@ class DirBruteforcer:
         print()
         return self.results
 
+    def export_json(self, filename: str) -> None:
+        data = []
+        for r in self.results:
+            data.append({
+                "url": r.url, "status_code": r.status_code,
+                "content_length": r.content_length, "redirect_url": r.redirect_url,
+            })
+        with open(filename, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"[*] Results exported to {filename}")
+
     def stop(self) -> None:
         self._stop_event.set()
 
@@ -269,12 +286,118 @@ def parse_status_codes(status_str: str) -> List[int]:
     return codes
 
 
+# ---------------------------------------------------------------------------
+# Built-in simulators
+# ---------------------------------------------------------------------------
+
+HIDDEN_PATHS = {
+    "/admin": (200, b"<html><body><h1>Admin panel</h1></body></html>"),
+    "/backup": (200, b"<html><body><h1>Backup files</h1></body></html>"),
+    "/config": (403, b"<html><body><h1>403 Forbidden</h1></body></html>"),
+    "/robots.txt": (200, b"User-agent: *\nDisallow: /admin"),
+    "/.env": (200, b"DB_PASSWORD=labsecret_dontleak"),
+    "/private": (301, b""),
+}
+
+
+class HiddenDirHandler(BaseHTTPRequestHandler):
+    """Simulates a server with discoverable hidden paths."""
+
+    def do_GET(self):
+        entry = HIDDEN_PATHS.get(self.path)
+        if entry is None:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"<html><body><h1>404 Not Found</h1></body></html>")
+            return
+        status, body = entry
+        loc = None
+        if self.path == "/private":
+            status, body, loc = 301, b"", "/login"
+        self.send_response(status)
+        if loc:
+            self.send_header("Location", loc)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(body)
+
+    log_message = lambda self, fmt, *args: None  # noqa: E731
+
+
+class CleanDirHandler(BaseHTTPRequestHandler):
+    """Control server: every path 404s, nothing discoverable."""
+
+    def do_GET(self):
+        self.send_response(404)
+        self.end_headers()
+        self.wfile.write(b"<html><body><h1>404 Not Found</h1></body></html>")
+
+    log_message = lambda self, fmt, *args: None  # noqa: E731
+
+
+def _run_scan_against(server, wordlist, extinct=None):
+    base = f"http://127.0.0.1:{server.server_port}"
+    filter_codes = [200, 201, 301, 302, 307, 308, 403]
+    bf = DirBruteforcer(
+        base_url=base, wordlist=wordlist, threads=4, timeout=3,
+        status_filter=filter_codes, verbose=False,
+    )
+    bf.scan()
+    return bf
+
+
+def demo():
+    """Offline demo: bruteforce the built-in vulnerable simulator, then the clean one."""
+    wordlist = [w for w in DEFAULT_WORDLIST]
+    vuln = HTTPServer(("127.0.0.1", 0), HiddenDirHandler)
+    thread_v = threading.Thread(target=vuln.serve_forever, daemon=True)
+    thread_v.start()
+
+    clean = HTTPServer(("127.0.0.1", 0), CleanDirHandler)
+    thread_c = threading.Thread(target=clean.serve_forever, daemon=True)
+    thread_c.start()
+
+    print("  +------------------------------------------+")
+    print("  |     WEB4 -- Directory Bruteforcer         |")
+    print("  +------------------------------------------+\n")
+    print(f"[*] DEMO MODE: vulnerable simulator on http://127.0.0.1:{vuln.server_port}")
+    print(f"[*] DEMO MODE: clean control simulator on http://127.0.0.1:{clean.server_port}\n")
+
+    print("=" * 40)
+    print("  VULNERABLE TARGET (hidden paths planted)")
+    print("=" * 40)
+    bf_v = _run_scan_against(vuln, wordlist)
+    print()
+
+    print("=" * 40)
+    print("  CLEAN CONTROL TARGET (nothing discoverable)")
+    print("=" * 40)
+    bf_c = _run_scan_against(clean, wordlist)
+    print()
+
+    vuln.shutdown()
+    clean.shutdown()
+
+    if bf_v.stats.found > 0 and bf_c.stats.found == 0:
+        print("[+] Demo: hidden paths found on vulnerable simulator, none on clean control.")
+        print(f"[+] Vulnerable simulator findings: {bf_v.stats.found}")
+        print("[+] Exit 0 -- scanner works correctly.")
+        sys.exit(0)
+    print("[-] Demo: unexpected result -- scanner may need tuning.")
+    sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="WEB4 — Directory Bruteforcer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  %(prog)s http://127.0.0.1:<port>
+  %(prog)s http://127.0.0.1:<port> -w wordlist.txt -t 20 -e .php,.html -o out.json -v
+  %(prog)s --demo
+        """,
     )
-    parser.add_argument("target", help="Target URL (e.g. http://example.com)")
+    parser.add_argument("target", nargs="?", help="Target URL (e.g. http://127.0.0.1:<port>)")
     parser.add_argument("-w", "--wordlist", help="Path to wordlist file")
     parser.add_argument("-t", "--threads", type=int, default=10, help="Number of threads (default: 10)")
     parser.add_argument("-s", "--status", default="200,201,301,302,403",
@@ -284,8 +407,18 @@ def main():
     parser.add_argument("--timeout", type=int, default=5, help="Request timeout in seconds (default: 5)")
     parser.add_argument("-r", "--recursive", action="store_true", help="Enable recursive scanning")
     parser.add_argument("--follow-redirects", action="store_true", help="Follow HTTP redirects")
+    parser.add_argument("-o", "--output", help="Export results to JSON file")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    parser.add_argument("--demo", action="store_true", help="Run offline demo against built-in simulators")
 
     args = parser.parse_args()
+
+    if args.demo:
+        demo()
+        return
+
+    if not args.target:
+        parser.error("target is required (or use --demo)")
 
     wordlist = DEFAULT_WORDLIST
     if args.wordlist:
@@ -304,10 +437,13 @@ def main():
         timeout=args.timeout,
         recursive=args.recursive,
         follow_redirects=args.follow_redirects,
+        verbose=args.verbose,
     )
 
     try:
         bruteforcer.scan()
+        if args.output:
+            bruteforcer.export_json(args.output)
     except KeyboardInterrupt:
         print("\n[!] Scan interrupted by user")
         bruteforcer.stop()

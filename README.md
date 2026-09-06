@@ -31,21 +31,40 @@ python3 --version  # Requires Python 3.7+
 ## Usage
 
 ```bash
-# Basic scan
-python3 dirbrute.py http://example.com
+# Offline demo: brute-forces the built-in vulnerable + clean simulators (exit 0)
+python3 dirbrute.py --demo
+
+# Live scan of a lab target (127.0.0.1 / 192.0.2.x only)
+python3 dirbrute.py http://127.0.0.1:<port>
 
 # With custom wordlist
-python3 dirbrute.py http://example.com -w wordlist.txt
+python3 dirbrute.py http://127.0.0.1:<port> -w wordlist.txt
 
 # With extensions and threads
-python3 dirbrute.py http://example.com -e .php,.html,.bak -t 20
+python3 dirbrute.py http://127.0.0.1:<port> -e .php,.html,.bak -t 20
 
-# Recursive scan with specific status codes
-python3 dirbrute.py http://example.com -r -s 200,301,302,403
+# Recursive scan with specific status codes and JSON export
+python3 dirbrute.py http://127.0.0.1:<port> -r -s 200,301,302,403 -o findings/dirs.json
 
-# Follow redirects
-python3 dirbrute.py http://example.com --follow-redirects
+# Follow redirects / verbose output
+python3 dirbrute.py http://127.0.0.1:<port> --follow-redirects -v
 ```
+
+## CLI Options
+
+| Option | Description |
+|--------|-------------|
+| `target` | Target URL (e.g. http://127.0.0.1:<port>) |
+| `-w, --wordlist` | Path to a wordlist file |
+| `-t, --threads` | Number of concurrent threads (default: 10) |
+| `-s, --status` | Status codes to report (default: 200,201,301,302,403) |
+| `-e, --extensions` | Extensions to append (comma-separated) |
+| `--timeout` | Per-request timeout in seconds |
+| `-r, --recursive` | Recursively scan discovered directories |
+| `--follow-redirects` | Follow HTTP redirects (default: report Location) |
+| `-o, --output` | Export results to a JSON file |
+| `-v, --verbose` | Verbose output |
+| `--demo` | Offline demo against the two built-in simulators |
 
 ## Example Output
 
@@ -117,6 +136,43 @@ If you discover vulnerabilities using this tool, follow responsible disclosure p
 1. Report to the vendor/owner privately
 2. Allow reasonable time for remediation
 3. Do not exploit beyond proof of concept
+
+## Running the Demo and Tests
+
+The project ships two built-in simulators (stdlib `http.server`):
+
+- **Vulnerable** — a server with planted hidden paths (`/admin`, `/backup`,
+  `/config` (403), `/robots.txt`, `/.env`, `/private` (301 redirect)).
+- **Clean** — a control server that returns 404 for every path.
+
+`--demo` runs the full brute-force engine (same HTTP code path as a live target)
+against both simulators and confirms the planted paths are found and the clean
+control produces zero findings.
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+## Live Lab Test Plan
+
+Test only against targets in your own lab (e.g. a deliberately configured web
+server on 127.0.0.1 or 192.0.2.x RFC-5737 space):
+
+1. Deploy a local web server with a small set of known hidden files.
+2. Baseline: `python3 dirbrute.py http://127.0.0.1:<port> -v`
+3. Confirm the known hidden paths are reported with the expected status codes.
+4. Point the scanner at a hardened server listing no hidden resources and confirm
+   zero findings.
+5. If recursive enabled, confirm discovered directories expand the scan.
+6. Document the target, wordlist used, and the status-code evidence in your lab
+   report.
+
+## Metrics
+
+- **Video metric**: 60-second screencast of `python3 dirbrute.py --demo` (vulnerable
+  findings + clean control zero findings) and `python3 -m unittest discover -s tests -v`,
+  recorded against the lab-only loopback target.
+- **Pass rate**: all unit tests green; demo exit 0.
 
 ## License
 
